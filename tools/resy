@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""Resy API client for searching restaurants and managing reservations."""
+
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.parse
+import urllib.error
+
+API_BASE = "https://api.resy.com"
+API_KEY = "VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"
+
+# Default location: Los Angeles
+DEFAULT_LAT = 34.0522
+DEFAULT_LONG = -118.2437
+
+def get_auth_token():
+    token_file = os.path.expanduser("~/.config/resy/auth_token")
+    if os.path.exists(token_file):
+        with open(token_file) as f:
+            return f.read().strip()
+    token = os.environ.get("RESY_AUTH_TOKEN")
+    if token:
+        return token
+    print("Error: No auth token found. Set RESY_AUTH_TOKEN or create ~/.config/resy/auth_token", file=sys.stderr)
+    sys.exit(1)
+
+def api_request(method, path, params=None, body=None):
+    token = get_auth_token()
+    headers = {
+        "Authorization": f'ResyAPI api_key="{API_KEY}"',
+        "X-Resy-Auth-Token": token,
+    }
+
+    if method == "GET" and params:
+        url = f"{API_BASE}{path}?{urllib.parse.urlencode(params)}"
+    else:
+        url = f"{API_BASE}{path}"
+
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode()
+    else:
+        data = None
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()
+        try:
+            err = json.loads(err_body)
+            print(f"API error {e.code}: {err.get('message', err_body)}", file=sys.stderr)
+        except Exception:
+            print(f"API error {e.code}: {err_body}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_search(args):
+    """Search for a restaurant by name."""
+    body = {
+        "query": args.query,
+        "geo": {"latitude": args.lat, "longitude": args.long},
+        "types": ["venue"],
+        "per_page": args.limit,
+    }
+    data = api_request("POST", "/3/venuesearch/search", body=body)
+    hits = data.get("search", {}).get("hits", [])
+
+    if args.json:
+        results = []
+        for h in hits:
+            results.append({
+                "venue_id": h.get("id", {}).get("resy"),
+                "name": h.get("name"),
+                "neighborhood": h.get("neighborhood"),
+                "locality": h.get("locality"),
+                "region": h.get("region"),
+                "cuisine": h.get("cuisine", []),
+                "price_range": h.get("price_range"),
+                "url_slug": h.get("url_slug"),
+            })
+        print(json.dumps(results, indent=2))
+    else:
+        if not hits:
+            print("No restaurants found.")
+            return
+        for h in hits:
+            vid = h.get("id", {}).get("resy", "?")
+            name = h.get("name", "?")
+            hood = h.get("neighborhood", "")
+            cuisine = ", ".join(h.get("cuisine", []))
+            price = h.get("price_range", "")
+            loc_parts = [x for x in [hood, h.get("locality", "")] if x]
+            loc = " - ".join(loc_parts)
+            print(f"  {name} (id:{vid}) — {loc} | {cuisine} | {price}")
+
+def cmd_browse(args):
+    """Browse available restaurants by location and date."""
+    params = {
+        "lat": args.lat,
+        "long": args.long,
+        "day": args.day,
+        "party_size": args.party_size,
+        "limit": args.limit,
+    }
+    data = api_request("GET", "/4/find", params=params)
+    venues = data.get("results", {}).get("venues", [])
+
+    if args.json:
+        results = []
+        for v in venues:
+            venue = v.get("venue", {})
+            slots = v.get("slots", [])
+            times = sorted(set(
+                s.get("date", {}).get("start", "").split(" ")[1][:5]
+                for s in slots
+                if " " in s.get("date", {}).get("start", "")
+            ))
+            results.append({
+                "venue_id": venue.get("id", {}).get("resy"),
+                "name": venue.get("name"),
+                "neighborhood": venue.get("location", {}).get("neighborhood"),
+                "price_range": venue.get("price_range"),
+                "rating": venue.get("rating"),
+                "available_times": times,
+                "url_slug": venue.get("url_slug"),
+            })
+        print(json.dumps(results, indent=2))
+    else:
+        if not venues:
+            print("No restaurants with availability found.")
+            return
+        print(f"\nAvailable {args.day}, party of {args.party_size}:\n")
+        for v in venues:
+            venue = v.get("venue", {})
+            name = venue.get("name", "?")
+            vid = venue.get("id", {}).get("resy", "?")
+            hood = venue.get("location", {}).get("neighborhood", "")
+            rating = venue.get("rating") or 0
+            price = venue.get("price_range") or 0
+            price_str = "$" * price if price else "?"
+            slots = v.get("slots", [])
+            times = sorted(set(
+                s.get("date", {}).get("start", "").split(" ")[1][:5]
+                for s in slots
+                if " " in s.get("date", {}).get("start", "")
+            ))
+            time_preview = ", ".join(times[:5])
+            if len(times) > 5:
+                time_preview += "..."
+            rating_str = f"{rating:.1f}" if rating else "-"
+            print(f"  {name} (id:{vid}) — {hood} | {price_str} | {rating_str}")
+            if times:
+                print(f"    times: {time_preview}")
+
+def cmd_slots(args):
+    """Find available time slots for a venue."""
+    params = {
+        "venue_id": args.venue_id,
+        "day": args.day,
+        "party_size": args.party_size,
+        "lat": args.lat,
+        "long": args.long,
+    }
+    data = api_request("GET", "/4/find", params=params)
+    venues = data.get("results", {}).get("venues", [])
+
+    if not venues:
+        print("No availability.")
+        return
+
+    v = venues[0]
+    venue_name = v.get("venue", {}).get("name", "?")
+    slots = v.get("slots", [])
+
+    if args.json:
+        results = []
+        for s in slots:
+            dt = s.get("date", {})
+            config = s.get("config", {})
+            results.append({
+                "start": dt.get("start"),
+                "end": dt.get("end"),
+                "type": config.get("type"),
+                "config_token": config.get("token"),
+            })
+        print(json.dumps({"venue": venue_name, "venue_id": args.venue_id, "day": args.day, "party_size": args.party_size, "slots": results}, indent=2))
+    else:
+        print(f"\n{venue_name} — {args.day}, party of {args.party_size}")
+        print(f"{'Time':<22} {'Type':<25}")
+        print("-" * 47)
+        seen = set()
+        for s in slots:
+            dt = s.get("date", {})
+            start = dt.get("start", "?").split(" ")[1][:5] if " " in dt.get("start", "") else dt.get("start", "?")
+            stype = s.get("config", {}).get("type", "?")
+            key = f"{start}-{stype}"
+            if key not in seen:
+                seen.add(key)
+                print(f"  {start:<20} {stype:<25}")
+
+def cmd_details(args):
+    """Get booking details for a specific slot (returns book_token)."""
+    body = {
+        "config_id": args.config_token,
+        "day": args.day,
+        "party_size": args.party_size,
+    }
+    data = api_request("POST", "/3/details", body=body)
+
+    bt = data.get("book_token", {})
+    cancel = data.get("cancellation", {})
+    payment = data.get("payment", {})
+    venue = data.get("venue", {})
+
+    if args.json:
+        print(json.dumps({
+            "book_token": bt.get("value"),
+            "token_expires": bt.get("date_expires"),
+            "venue": venue.get("name"),
+            "cancellation_policy": cancel.get("display", {}).get("policy", []),
+            "payment_method_id": data.get("user", {}).get("payment_methods", [{}])[0].get("id") if data.get("user", {}).get("payment_methods") else None,
+        }, indent=2))
+    else:
+        print(f"\nBooking details for {venue.get('name', '?')}")
+        print(f"Book token: {str(bt.get('value', '?'))[:60]}...")
+        print(f"Expires: {bt.get('date_expires', '?')}")
+        policies = cancel.get("display", {}).get("policy", [])
+        if policies:
+            print(f"Cancellation: {policies[0][:120]}")
+        pms = data.get("user", {}).get("payment_methods", [])
+        if pms:
+            pm = pms[0]
+            print(f"Payment: {pm.get('type', '?')} ending {pm.get('display', '?')} (id:{pm.get('id', '?')})")
+
+def cmd_book(args):
+    """Book a reservation (requires book_token from details)."""
+    body = {
+        "book_token": args.book_token,
+        "struct_payment_method": json.dumps({"id": args.payment_method_id}),
+        "source_id": "resy.com-venue-details",
+    }
+    data = api_request("POST", "/3/book", body=body)
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        resy_token = data.get("resy_token", "?")
+        reservation_id = data.get("reservation_id", "?")
+        print(f"Booked! Reservation ID: {reservation_id}")
+        print(f"Resy token: {resy_token}")
+
+def get_venue_name(venue_id):
+    """Look up venue name by ID."""
+    token = get_auth_token()
+    headers = {
+        "Authorization": f'ResyAPI api_key="{API_KEY}"',
+        "X-Resy-Auth-Token": token,
+    }
+    url = f"{API_BASE}/3/venue?{urllib.parse.urlencode({'id': venue_id, 'day': '2026-01-01', 'party_size': 2})}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+            return data.get("name", f"venue:{venue_id}")
+    except Exception:
+        return f"venue:{venue_id}"
+
+def cmd_reservations(args):
+    """List upcoming reservations."""
+    data = api_request("GET", "/3/user/reservations")
+    reservations = data if isinstance(data, list) else data.get("reservations", [])
+
+    if args.json:
+        venue_cache = {}
+        enriched = []
+        for r in reservations:
+            vid = r.get("venue", {}).get("id")
+            if vid and vid not in venue_cache:
+                venue_cache[vid] = get_venue_name(vid)
+            enriched.append({
+                "venue": venue_cache.get(vid, f"venue:{vid}"),
+                "venue_id": vid,
+                "day": r.get("day"),
+                "time": r.get("time_slot", "")[:5],
+                "party_size": r.get("num_seats"),
+                "type": r.get("config", {}).get("type"),
+                "resy_token": r.get("resy_token"),
+                "reservation_id": r.get("reservation_id"),
+                "status": "past" if r.get("status", {}).get("finished") else "upcoming",
+            })
+        print(json.dumps(enriched, indent=2))
+    else:
+        if not reservations:
+            print("No reservations.")
+            return
+        venue_cache = {}
+        for r in reservations:
+            vid = r.get("venue", {}).get("id")
+            if vid and vid not in venue_cache:
+                venue_cache[vid] = get_venue_name(vid)
+            name = venue_cache.get(vid, f"venue:{vid}")
+            day = r.get("day", "?")
+            time = r.get("time_slot", "?")[:5]
+            seats = r.get("num_seats", "?")
+            stype = r.get("config", {}).get("type", "")
+            finished = r.get("status", {}).get("finished", 0)
+            status = " (past)" if finished else ""
+            print(f"  {name} — {day} {time}, party of {seats} ({stype}){status}")
+
+def cmd_cancel(args):
+    """Cancel a reservation."""
+    body = {"resy_token": args.resy_token}
+    data = api_request("POST", "/3/cancel", body=body)
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print("Reservation cancelled.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Resy API client")
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--lat", type=float, default=DEFAULT_LAT)
+    parser.add_argument("--long", type=float, default=DEFAULT_LONG)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # browse
+    p = sub.add_parser("browse", help="Browse available restaurants by location/date")
+    p.add_argument("day", help="Date (YYYY-MM-DD)")
+    p.add_argument("--party-size", type=int, default=2)
+    p.add_argument("--limit", type=int, default=10)
+
+    # search
+    p = sub.add_parser("search", help="Search restaurants by name")
+    p.add_argument("query", help="Restaurant name or search term")
+    p.add_argument("--limit", type=int, default=5)
+
+    # slots
+    p = sub.add_parser("slots", help="Find available time slots")
+    p.add_argument("venue_id", type=int, help="Resy venue ID")
+    p.add_argument("day", help="Date (YYYY-MM-DD)")
+    p.add_argument("--party-size", type=int, default=2)
+
+    # details
+    p = sub.add_parser("details", help="Get booking details for a slot")
+    p.add_argument("config_token", help="Config token from slots command")
+    p.add_argument("day", help="Date (YYYY-MM-DD)")
+    p.add_argument("--party-size", type=int, default=2)
+
+    # book
+    p = sub.add_parser("book", help="Book a reservation")
+    p.add_argument("book_token", help="Book token from details command")
+    p.add_argument("payment_method_id", type=int, help="Payment method ID")
+
+    # reservations
+    sub.add_parser("reservations", help="List upcoming reservations")
+
+    # cancel
+    p = sub.add_parser("cancel", help="Cancel a reservation")
+    p.add_argument("resy_token", help="Resy token from booking")
+
+    args = parser.parse_args()
+    cmd = {
+        "browse": cmd_browse,
+        "search": cmd_search,
+        "slots": cmd_slots,
+        "details": cmd_details,
+        "book": cmd_book,
+        "reservations": cmd_reservations,
+        "cancel": cmd_cancel,
+    }
+    cmd[args.command](args)
+
+if __name__ == "__main__":
+    main()

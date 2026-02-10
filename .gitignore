@@ -1,0 +1,12 @@
+# Auth/secrets
+.env
+*.token
+auth_token
+
+# OS
+.DS_Store
+
+# Editor
+*.swp
+.idea/
+.vscode/
