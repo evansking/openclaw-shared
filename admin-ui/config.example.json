@@ -1,0 +1,33 @@
+{
+  "_comment": "Copy this file to ~/.config/admin-ui/config.json and customize",
+
+  "openclaw_dir": "~/.openclaw",
+  "bin_dir": "~/bin",
+  "clawd_dir": "~/clawd",
+  "user_name": "User",
+  "dm_context": "Main DM",
+  "app_title": "OpenClaw Admin",
+
+  "features": {
+    "text_processor": false,
+    "blog_watcher": false,
+    "active_chats": false,
+    "friends": true,
+    "stories": true,
+    "linkedin_drafts": false,
+    "watchdog": false
+  },
+
+  "text_processor": {
+    "chat_db": "~/Library/Messages/chat.db",
+    "contacts_file": "~/contacts.txt"
+  },
+
+  "blog_watcher": {
+    "feedwatcher_dir": "~/.feedwatcher"
+  },
+
+  "services": [
+    "ai.openclaw.gateway"
+  ]
+}
