@@ -134,6 +134,61 @@ Search across markdown files using keyword or semantic search. Great for notes, 
 
 ---
 
+### text-processor
+**Auto-classify iMessages and take action**
+
+Watches incoming texts, classifies them using local LLM (DeepSeek), verifies with Claude, and takes action — saving memories, proposing reminders, or detecting calendar events.
+
+| Capability | Description |
+|------------|-------------|
+| `text-processor` | Run the daemon (polls every 3s) |
+| `theo-send --chat-id N --text "msg"` | Send as assistant + watch for replies |
+
+**Architecture:**
+1. DeepSeek-R1:8b (local via Ollama) does fast first-pass classification
+2. Claude (via OpenClaw) verifies before taking action
+3. Memories saved to markdown files, reminders/calendar sent as confirmation texts
+
+**Dependencies:**
+
+| Dependency | Install | Purpose |
+|------------|---------|---------|
+| Python 3 | (pre-installed on macOS) | Runtime |
+| Ollama | `brew install ollama` | Local LLM server |
+| DeepSeek-R1:8b | `ollama pull deepseek-r1:8b` | Classification model |
+| imsg | `brew install steipete/tap/imsg` | iMessage access |
+| OpenClaw | `npm install -g openclaw` | Claude verification + cron |
+| requests | `pip3 install requests` | HTTP client for Ollama |
+
+**Setup required:**
+
+1. Install dependencies above
+2. Create config file `~/.config/text-processor/config.json`:
+
+```json
+{
+  "my_number": "+1234567890",
+  "bot_identifiers": ["your-bot@email.com"],
+  "contacts_file": "/path/to/contacts.txt",
+  "memory_dir": "/path/to/memory/friends",
+  "prompt_file": "/path/to/classifier-prompt.txt",
+  "watched_chats_file": "/path/to/watched-chats.json",
+  "decisions_file": "~/.openclaw/text-processor-decisions.json",
+  "state_file": "~/.openclaw/text-processor-state.json",
+  "signature": "- YourBot (Your Assistant)"
+}
+```
+
+3. Copy `classifier-prompt.txt` to your prompt_file path
+4. Create a contacts file (format: `+1234567890|Name` per line)
+5. Grant Full Disk Access to your terminal
+6. Start Ollama: `ollama serve`
+7. Run: `text-processor`
+
+**Tools:** `tools/text-processor`, `tools/theo-send`, `tools/classifier-prompt.txt` (Python)
+
+---
+
 ## Quick Reference
 
 | Skill | What it does | Credentials needed |
@@ -143,3 +198,4 @@ Search across markdown files using keyword or semantic search. Great for notes, 
 | kindle | Send articles to Kindle | SMTP + Kindle email |
 | imsg | Read/send iMessages | macOS permissions |
 | qmd | Search markdown files | None |
+| text-processor | Auto-classify texts, save memories | Config file + Ollama + OpenClaw |

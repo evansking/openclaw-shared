@@ -1,0 +1,1196 @@
+#!/usr/bin/env python3
+"""
+Text processor daemon that:
+1. Watches evan's incoming messages via imsg watch
+2. Classifies each message using local DeepSeek
+3. Takes action (memory update or reminder creation)
+"""
+
+import subprocess
+import json
+import requests
+import os
+import sys
+import time
+import shlex
+from datetime import datetime, timezone, timedelta
+
+# Config file location
+CONFIG_FILE = os.path.expanduser("~/.config/text-processor/config.json")
+
+def load_config():
+    """Load config from file, fall back to defaults if not found."""
+    home = os.path.expanduser("~")
+    defaults = {
+        "my_number": "+1XXXXXXXXXX",
+        "bot_identifiers": ["your-bot@email.com"],
+        "contacts_file": os.path.join(home, "contacts.txt"),
+        "memory_dir": os.path.join(home, "memory/friends"),
+        "prompt_file": os.path.join(home, ".config/text-processor/classifier-prompt.txt"),
+        "watched_chats_file": os.path.join(home, ".config/text-processor/watched-chats.json"),
+        "decisions_file": os.path.join(home, ".openclaw/text-processor-decisions.json"),
+        "state_file": os.path.join(home, ".openclaw/text-processor-state.json"),
+        "signature": "- Assistant"
+    }
+    try:
+        with open(CONFIG_FILE) as f:
+            config = json.load(f)
+            # Merge with defaults (config values override)
+            return {**defaults, **config}
+    except Exception:
+        return defaults
+
+CONFIG = load_config()
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL = "deepseek-r1:8b"
+CONTACTS_FILE = CONFIG["contacts_file"]
+CONTACTS_MAP = {}  # Loaded at startup: normalized_phone -> name
+MEMORY_DIR = CONFIG["memory_dir"]
+PROMPT_FILE = CONFIG["prompt_file"]
+MY_NUMBER = CONFIG["my_number"]
+CONFIDENCE_THRESHOLD = 0.7
+WATCHED_CHATS_FILE = CONFIG["watched_chats_file"]
+WATCH_TIMEOUT_SECONDS = 3600  # 1 hour
+DECISIONS_FILE = CONFIG["decisions_file"]
+DECISIONS_MAX = 1000
+ALERT_COOLDOWN_SECONDS = 600  # Only alert Evan once per 10 minutes per error type
+_last_alert_times = {}  # key -> timestamp
+BOT_IDENTIFIERS = CONFIG["bot_identifiers"]
+SIGNATURE = CONFIG["signature"]
+
+def log(msg):
+    """Log with timestamp"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{timestamp}] {msg}", flush=True)
+
+def normalize_phone(phone):
+    """Normalize phone to last 10 digits"""
+    return ''.join(c for c in phone if c.isdigit())[-10:]
+
+def make_decision_id():
+    """Generate a unique decision ID"""
+    ts = int(time.time())
+    suffix = os.urandom(3).hex()
+    return f"{ts}-{suffix}"
+
+def load_decisions():
+    """Load existing decisions from file"""
+    try:
+        with open(DECISIONS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_decision(record):
+    """Append a decision record, keeping rolling cap"""
+    try:
+        decisions = load_decisions()
+        decisions.insert(0, record)
+        if len(decisions) > DECISIONS_MAX:
+            decisions = decisions[:DECISIONS_MAX]
+        os.makedirs(os.path.dirname(DECISIONS_FILE), exist_ok=True)
+        with open(DECISIONS_FILE, 'w') as f:
+            json.dump(decisions, f, indent=2)
+    except Exception as e:
+        log(f"Error saving decision: {e}")
+
+def load_contacts():
+    """Load contacts into memory map"""
+    global CONTACTS_MAP
+    CONTACTS_MAP = {}
+    try:
+        with open(CONTACTS_FILE) as f:
+            for line in f:
+                if '|' in line:
+                    number, name = line.strip().split('|', 1)
+                    key = normalize_phone(number)
+                    if key and len(key) >= 7:  # Valid phone
+                        CONTACTS_MAP[key] = name.strip()
+        log(f"Loaded {len(CONTACTS_MAP)} contacts")
+    except Exception as e:
+        log(f"Error loading contacts: {e}")
+
+def lookup_contact(phone):
+    """O(1) lookup by normalized phone"""
+    key = normalize_phone(phone)
+    return CONTACTS_MAP.get(key)
+
+def classify_message(sender_name, message_text, conversation_context=None):
+    """Send message to DeepSeek for classification with conversation context"""
+    try:
+        with open(PROMPT_FILE) as f:
+            system_prompt = f.read()
+
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')
+
+        # Build conversation context string
+        context_str = ""
+        if conversation_context:
+            context_str = "Recent conversation (for context):\n"
+            for msg in conversation_context:
+                direction = "Evan" if msg.get('is_from_me') else (sender_name or "Them")
+                text = msg.get('text', '')[:200]
+                context_str += f"  {direction}: {text}\n"
+            context_str += "\n"
+
+        prompt = f"""{system_prompt}
+
+Current datetime: {current_time}
+Sender: {sender_name or 'Unknown'}
+
+{context_str}>>> LATEST MESSAGE TO CLASSIFY <<<
+{message_text}
+
+Based on the LATEST MESSAGE above (using conversation context if needed), provide your classification.
+
+JSON response:"""
+
+        response = requests.post(OLLAMA_URL, json={
+            "model": MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json"
+        }, timeout=120)
+
+        result = response.json()
+        return json.loads(result['response'])
+    except Exception as e:
+        log(f"Error classifying message: {e}")
+        return {"action": "none", "confidence": 0}
+
+def verify_reminder_with_claude(sender_name, message_text, reminder_what, reminder_when, conversation_context=None):
+    """Second-layer verification using openclaw agent - also generates natural confirmation message"""
+    try:
+        # Build context string
+        context_str = ""
+        if conversation_context:
+            context_str = "Recent conversation:\n"
+            for msg in conversation_context:
+                direction = "Evan" if msg.get('is_from_me') else (sender_name or "Them")
+                text = msg.get('text', '')[:200]
+                context_str += f"  {direction}: {text}\n"
+
+        # Format the when time nicely
+        try:
+            dt = datetime.fromisoformat(reminder_when.replace('Z', '+00:00'))
+            when_friendly = dt.strftime('%A %b %d at %I:%M %p')
+        except:
+            when_friendly = reminder_when
+
+        prompt = f"""A message came in that might need a reminder for Evan.
+
+{context_str}
+
+Latest message from {sender_name or 'someone'}:
+"{message_text}"
+
+Potential reminder:
+- What: {reminder_what}
+- When: {when_friendly}
+
+Does Evan PERSONALLY need to be reminded about this? Only YES if:
+- Evan is attending/participating
+- Evan made a commitment to follow up
+- Something Evan specifically needs to do
+
+NO if:
+- Other people discussing their schedules
+- Someone answering a question Evan didn't ask
+- General info sharing not involving Evan
+
+If YES, write a casual text to Evan that:
+- Mentions what you saw (e.g. "saw in your texts that...")
+- Explains what you'd remind him about
+- Says when you'd set the reminder for (specific day/time)
+- Asks him to confirm
+
+Example tone: "Hey, saw your chat with James about dinner Wednesday. Want me to set a reminder Tuesday evening so you don't forget to book a spot? Just say yes and I'll set it up."
+
+Be natural and conversational. Include enough detail that when Evan replies "yes", I know exactly what reminder to create.
+
+Respond with ONLY valid JSON (no markdown, no code blocks):
+{{"needs_reminder": true/false, "reason": "brief explanation", "message": "the full conversational message to send"}}"""
+
+        result = subprocess.run(
+            ['openclaw', 'agent', '--agent', 'worker',
+             '--message', prompt, '--json', '--thinking', 'off'],
+            capture_output=True, text=True, timeout=60
+        )
+
+        if result.returncode != 0:
+            log(f"openclaw agent error: {result.stderr}")
+            return {"needs_reminder": False}
+
+        # Parse the JSON response from openclaw
+        response_data = json.loads(result.stdout)
+
+        # Get the agent's reply from result.payloads[0].text
+        payloads = response_data.get('result', {}).get('payloads', [])
+        if not payloads:
+            log("No payloads in openclaw response")
+            return {"needs_reminder": False}
+
+        agent_reply = payloads[0].get('text', '')
+        log(f"Agent reply: {agent_reply}")
+
+        # Extract JSON from the reply (might have extra text)
+        if '{' in agent_reply:
+            start = agent_reply.index('{')
+            end = agent_reply.rindex('}') + 1
+            json_match = agent_reply[start:end]
+            verification = json.loads(json_match)
+            log(f"Claude verification: {verification}")
+            return verification
+        else:
+            log(f"No JSON found in reply: {agent_reply}")
+            return {"needs_reminder": False}
+    except Exception as e:
+        log(f"Error in Claude verification: {e}")
+        return {"needs_reminder": False}
+
+# Categories that go in index.md (permanent/core facts)
+CORE_CATEGORIES = {'family', 'work', 'preference', 'contact_info', 'birthday', 'pet'}
+# Categories that go in monthly files (topical/time-sensitive)
+TOPICAL_CATEGORIES = {'life_event', 'health', 'relationship', 'address', 'other'}
+
+def find_matching_folders(name):
+    """Find existing folders that match by first name"""
+    if not name:
+        return []
+    first_name = name.lower().split()[0].replace("'", "").replace('-', '')
+    matches = []
+    try:
+        for folder in os.listdir(MEMORY_DIR):
+            folder_path = os.path.join(MEMORY_DIR, folder)
+            if os.path.isdir(folder_path) and not folder.startswith('_'):
+                # Extract first name from folder (e.g., "madison-mccoy" -> "madison")
+                folder_first = folder.split('-')[0].lower()
+                if folder_first == first_name:
+                    matches.append(folder)
+    except Exception as e:
+        log(f"Error scanning memory folders: {e}")
+    return matches
+
+def ask_which_person(fact, matches):
+    """Ask user which person to save the fact to when there's a collision"""
+    try:
+        options = ", ".join(matches)
+        message = f"Got a fact to save but found multiple people: {options}. Which one should I save this to?\n\nFact: {fact}"
+
+        job_name = f"memory-collision-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        run_at = (datetime.now(timezone.utc) + timedelta(seconds=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        cmd = [
+            'openclaw', 'cron', 'add',
+            '--name', job_name,
+            '--agent', 'main',
+            '--at', run_at,
+            '--session', 'isolated',
+            '--message', f"Send this exact text to Evan: '{message}'",
+            '--deliver',
+            '--channel', 'imessage',
+            '--to', MY_NUMBER,
+            '--delete-after-run',
+            '--thinking', 'off'
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        log(f"Asked user to resolve collision between: {matches}")
+    except Exception as e:
+        log(f"Error asking about collision: {e}")
+
+def get_person_folder(person_name, fact=None):
+    """Get or create folder for a person, matching by first name"""
+    if not person_name:
+        return None
+
+    # Check for existing folders matching first name
+    matches = find_matching_folders(person_name)
+
+    if len(matches) == 1:
+        # Exactly one match - use it
+        folder_path = os.path.join(MEMORY_DIR, matches[0])
+        return folder_path
+    elif len(matches) > 1:
+        # Collision - ask user
+        log(f"Collision: {person_name} matches multiple folders: {matches}")
+        if fact:
+            ask_which_person(fact, matches)
+        return None  # Don't save until user clarifies
+    else:
+        # No match - create new folder
+        name_lower = person_name.lower().replace("'", "").replace(' ', '-')
+        folder_path = os.path.join(MEMORY_DIR, name_lower)
+        os.makedirs(folder_path, exist_ok=True)
+        return folder_path
+
+def ensure_index_file(folder_path, sender_name):
+    """Ensure index.md exists with basic structure"""
+    index_path = os.path.join(folder_path, 'index.md')
+    if not os.path.exists(index_path):
+        with open(index_path, 'w') as f:
+            f.write(f"# {sender_name}\n\n")
+            f.write("## Core\n\n")
+            f.write("## Preferences\n\n")
+    return index_path
+
+def get_monthly_file(folder_path):
+    """Get current month's file path"""
+    month_file = datetime.now().strftime('%Y-%m') + '.md'
+    return os.path.join(folder_path, month_file)
+
+def ensure_monthly_file(folder_path):
+    """Ensure current month file exists"""
+    monthly_path = get_monthly_file(folder_path)
+    if not os.path.exists(monthly_path):
+        month_name = datetime.now().strftime('%B %Y')
+        with open(monthly_path, 'w') as f:
+            f.write(f"# {month_name}\n\n")
+    return monthly_path
+
+def add_to_memory(person_name, fact, category):
+    """Add fact to person's memory folder (index.md or monthly file)"""
+    if not person_name:
+        log("Cannot add to memory: no person name")
+        return False
+
+    try:
+        folder_path = get_person_folder(person_name, fact)
+        if not folder_path:
+            # Collision or error - don't save
+            return False
+        day = datetime.now().strftime('%d')
+
+        # Determine if core (permanent) or topical (time-sensitive)
+        if category in CORE_CATEGORIES:
+            filepath = ensure_index_file(folder_path, sender_name)
+            # Add to Core section
+            with open(filepath, 'a') as f:
+                f.write(f"- ({category}) {fact}\n")
+            log(f"Added CORE fact for {sender_name}: {fact}")
+        else:
+            filepath = ensure_monthly_file(folder_path)
+            # Add to monthly file with day
+            with open(filepath, 'a') as f:
+                f.write(f"- [{day}] ({category}) {fact}\n")
+            log(f"Added TOPICAL fact for {sender_name}: {fact}")
+
+        return True
+    except Exception as e:
+        log(f"Error adding to memory: {e}")
+        return False
+
+def verify_memory_with_claude(sender_name, message_text, preliminary_fact, preliminary_category, conversation_context=None):
+    """Second-layer verification for memory - determines WHO the fact is about and refines it"""
+    try:
+        # Build context string
+        context_str = ""
+        if conversation_context:
+            context_str = "Recent conversation:\n"
+            for msg in conversation_context:
+                direction = "Evan" if msg.get('is_from_me') else (sender_name or "Them")
+                text = msg.get('text', '')[:200]
+                context_str += f"  {direction}: {text}\n"
+
+        prompt = f"""A message came in that might contain info worth remembering.
+
+{context_str}
+
+Message from {sender_name or 'someone'}:
+"{message_text}"
+
+DeepSeek flagged this as potential memory:
+- Fact: {preliminary_fact}
+- Category: {preliminary_category}
+
+Your job:
+1. Determine WHO this fact is actually about (might be sender, might be someone else mentioned)
+2. Decide if it's actually worth saving (is it meaningful/useful info?)
+3. Write a clean, concise fact to save
+
+Memory should be saved for the PERSON THE FACT IS ABOUT, not necessarily the sender.
+Example: If James texts "Ryan got a new job at Google", save to Ryan's memory, not James's.
+
+Just use the person's first name (e.g. "Madison", "James") - I'll match it to the right folder.
+
+Categories: family, work, health, preference, life_event, relationship, contact_info, address, birthday, pet, other
+
+Respond with ONLY valid JSON (no markdown, no code blocks):
+{{"save_memory": true/false, "reason": "brief explanation", "person_name": "who to save it for", "fact": "the clean fact to save", "category": "category"}}"""
+
+        result = subprocess.run(
+            ['openclaw', 'agent', '--agent', 'worker',
+             '--message', prompt, '--json', '--thinking', 'off'],
+            capture_output=True, text=True, timeout=60
+        )
+
+        if result.returncode != 0:
+            log(f"openclaw agent error: {result.stderr}")
+            return {"save_memory": False}
+
+        response_data = json.loads(result.stdout)
+        payloads = response_data.get('result', {}).get('payloads', [])
+        if not payloads:
+            log("No payloads in openclaw response")
+            return {"save_memory": False}
+
+        agent_reply = payloads[0].get('text', '')
+        log(f"Memory verification reply: {agent_reply}")
+
+        if '{' in agent_reply:
+            start = agent_reply.index('{')
+            end = agent_reply.rindex('}') + 1
+            json_match = agent_reply[start:end]
+            verification = json.loads(json_match)
+            log(f"Claude memory verification: {verification}")
+            return verification
+        else:
+            log(f"No JSON found in reply: {agent_reply}")
+            return {"save_memory": False}
+    except Exception as e:
+        log(f"Error in Claude memory verification: {e}")
+        return {"save_memory": False}
+
+def send_confirmation(message):
+    """Send confirmation message via openclaw"""
+    try:
+        # Create one-shot cron job to send via openclaw agent
+        job_name = f"confirm-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        run_at = (datetime.now(timezone.utc) + timedelta(seconds=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        cmd = [
+            'openclaw', 'cron', 'add',
+            '--name', job_name,
+            '--agent', 'main',
+            '--at', run_at,
+            '--session', 'isolated',
+            '--message', f"Send this exact text to Evan (no additions): '{message}'",
+            '--deliver',
+            '--channel', 'imessage',
+            '--to', MY_NUMBER,
+            '--delete-after-run',
+            '--thinking', 'off'
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            log(f"Sent confirmation: {message}")
+            return True
+        else:
+            log(f"Error sending confirmation: {result.stderr}")
+            return False
+    except Exception as e:
+        log(f"Error sending confirmation: {e}")
+        return False
+
+def forward_reaction(reaction_type, original_text):
+    """Forward a tapback reaction to the main agent as a yes/no response"""
+    try:
+        if reaction_type in POSITIVE_REACTIONS:
+            intent = "yes"
+        elif reaction_type in NEGATIVE_REACTIONS:
+            intent = "no"
+        else:
+            return False
+
+        truncated = original_text[:200] if original_text else "(no text)"
+        prompt = (
+            f"Evan reacted with a {reaction_type} tapback to your message: "
+            f"'{truncated}'. Treat this as Evan replying '{intent}'. "
+            f"Take the appropriate action and let Evan know."
+        )
+
+        job_name = f"reaction-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        run_at = (datetime.now(timezone.utc) + timedelta(seconds=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        cmd = [
+            'openclaw', 'cron', 'add',
+            '--name', job_name,
+            '--agent', 'main',
+            '--at', run_at,
+            '--session', 'isolated',
+            '--message', prompt,
+            '--deliver',
+            '--channel', 'imessage',
+            '--to', MY_NUMBER,
+            '--delete-after-run',
+            '--thinking', 'off'
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            log(f"Forwarded {reaction_type} reaction on: {truncated[:50]}...")
+            return True
+        else:
+            log(f"Error forwarding reaction: {result.stderr}")
+            return False
+    except Exception as e:
+        log(f"Error forwarding reaction: {e}")
+        return False
+
+def verify_calendar_with_claude(sender_name, message_text, title, when, duration, location, conversation_context=None):
+    """Second-layer verification for calendar events"""
+    try:
+        # Build context string
+        context_str = ""
+        if conversation_context:
+            context_str = "Recent conversation:\n"
+            for msg in conversation_context:
+                direction = "Evan" if msg.get('is_from_me') else (sender_name or "Them")
+                text = msg.get('text', '')[:200]
+                context_str += f"  {direction}: {text}\n"
+
+        # Format the when time nicely
+        try:
+            dt = datetime.fromisoformat(when.replace('Z', '+00:00'))
+            when_friendly = dt.strftime('%A %b %d at %I:%M %p')
+        except:
+            when_friendly = when
+
+        prompt = f"""A message came in that might be a calendar event for Evan.
+
+{context_str}
+
+Message from {sender_name or 'someone'}:
+"{message_text}"
+
+DeepSeek flagged this as potential calendar event:
+- Title: {title}
+- When: {when_friendly}
+- Duration: {duration} hours
+- Location: {location or 'not specified'}
+
+Is this an event that EVAN will be ATTENDING/PARTICIPATING in?
+(Not just info about someone else's schedule)
+
+Only YES if Evan needs to block time on his calendar for this.
+
+If YES, write a casual text asking Evan to confirm. Include:
+- What the event is
+- When it is (day and time)
+- Ask if he wants it on his calendar
+
+Example: "Hey, saw you're doing dinner with James Friday at 7pm. Want me to add it to your calendar?"
+
+Respond with ONLY valid JSON (no markdown, no code blocks):
+{{"add_to_calendar": true/false, "reason": "brief explanation", "message": "the casual text to send", "title": "clean event title", "start_time": "ISO datetime", "duration_hours": number, "location": "location or null"}}"""
+
+        result = subprocess.run(
+            ['openclaw', 'agent', '--agent', 'worker',
+             '--message', prompt, '--json', '--thinking', 'off'],
+            capture_output=True, text=True, timeout=60
+        )
+
+        if result.returncode != 0:
+            log(f"openclaw agent error: {result.stderr}")
+            return {"add_to_calendar": False}
+
+        log(f"openclaw stdout length: {len(result.stdout)}")
+        if not result.stdout.strip():
+            log(f"Empty stdout, stderr: {result.stderr}")
+            return {"add_to_calendar": False}
+
+        response_data = json.loads(result.stdout)
+        payloads = response_data.get('result', {}).get('payloads', [])
+        if not payloads:
+            log("No payloads in openclaw response")
+            return {"add_to_calendar": False}
+
+        agent_reply = payloads[0].get('text', '')
+        log(f"Calendar verification reply: {agent_reply}")
+
+        if '{' in agent_reply:
+            start = agent_reply.index('{')
+            end = agent_reply.rindex('}') + 1
+            json_match = agent_reply[start:end]
+            verification = json.loads(json_match)
+            log(f"Claude calendar verification: {verification}")
+            return verification
+        else:
+            log(f"No JSON found in reply: {agent_reply}")
+            return {"add_to_calendar": False}
+    except Exception as e:
+        log(f"Error in Claude calendar verification: {e}")
+        return {"add_to_calendar": False}
+
+def alert_evan(error_key, message):
+    """Send Evan an iMessage alert, throttled to once per ALERT_COOLDOWN_SECONDS per error_key."""
+    now = time.time()
+    last = _last_alert_times.get(error_key, 0)
+    if now - last < ALERT_COOLDOWN_SECONDS:
+        return
+    _last_alert_times[error_key] = now
+    try:
+        subprocess.run(
+            ['openclaw', 'message', 'send', '--channel', 'imessage',
+             '--target', 'chat_id:1', '--message', f"[Theo alert] {message}"],
+            capture_output=True, text=True, timeout=15
+        )
+        log(f"Alerted Evan: {message[:80]}")
+    except Exception as e:
+        log(f"Failed to send alert to Evan: {e}")
+
+
+def load_watched_chats():
+    """Load list of chats we're actively watching"""
+    try:
+        with open(WATCHED_CHATS_FILE) as f:
+            chats = json.load(f)
+        # Clean expired entries
+        now = datetime.now(timezone.utc).isoformat()
+        active = [c for c in chats if c.get('expires_at', '') > now]
+        if len(active) != len(chats):
+            save_watched_chats(active)
+            log(f"Cleaned {len(chats) - len(active)} expired chat watchers")
+        return active
+    except Exception:
+        return []
+
+def save_watched_chats(chats):
+    """Save watched chats list"""
+    try:
+        with open(WATCHED_CHATS_FILE, 'w') as f:
+            json.dump(chats, f, indent=2)
+    except Exception as e:
+        log(f"Error saving watched chats: {e}")
+
+def refresh_watch_expiry(chat_id):
+    """Reset the expiry for a watched chat (called on each new message)"""
+    chats = load_watched_chats()
+    new_expiry = (datetime.now(timezone.utc) + timedelta(seconds=WATCH_TIMEOUT_SECONDS)).isoformat()
+    for c in chats:
+        if c.get('chat_id') == chat_id:
+            c['expires_at'] = new_expiry
+            break
+    save_watched_chats(chats)
+
+
+def auto_register_chat(chat_id, context_hint=None):
+    """Auto-register a chat for watching when Theo sends a message.
+
+    This is called whenever we detect an outgoing message with Theo's signature.
+    If the chat is already registered, just refresh the expiry.
+    """
+    if not chat_id:
+        return
+
+    chats = load_watched_chats()
+    new_expiry = (datetime.now(timezone.utc) + timedelta(seconds=WATCH_TIMEOUT_SECONDS)).isoformat()
+
+    # Check if already registered
+    for c in chats:
+        if c.get('chat_id') == chat_id:
+            c['expires_at'] = new_expiry
+            save_watched_chats(chats)
+            log(f"Refreshed watcher for chat {chat_id}")
+            return
+
+    # Not registered - add it
+    context = context_hint or f"auto-registered chat {chat_id}"
+    chats.append({
+        "chat_id": chat_id,
+        "context": context,
+        "expires_at": new_expiry
+    })
+    save_watched_chats(chats)
+    log(f"Auto-registered chat {chat_id} for watching: {context}")
+
+def get_chat_context_for_watched(chat_id, limit=15):
+    """Fetch recent messages from a chat for watcher context"""
+    try:
+        result = subprocess.run(
+            ['ssh', 'evan@localhost', '/opt/homebrew/bin/imsg', 'history',
+             '--chat-id', str(chat_id), '--limit', str(limit), '--json'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            # Strip null bytes that can come from garbled messages
+            clean_stdout = result.stdout.replace('\x00', '').replace('\ufffd', '')
+            messages = []
+            for line in clean_stdout.strip().split('\n'):
+                if line:
+                    try:
+                        msg = json.loads(line)
+                        # Clean null bytes from text fields
+                        if 'text' in msg and msg['text']:
+                            msg['text'] = msg['text'].replace('\x00', '').replace('\ufffd', '')
+                        messages.append(msg)
+                    except:
+                        pass
+            messages.sort(key=lambda x: x.get('created_at', ''))
+            # Resolve sender names
+            for msg in messages:
+                if msg.get('is_from_me'):
+                    msg['display_name'] = 'Evan'
+                else:
+                    sender = msg.get('sender', '')
+                    name = lookup_contact(sender)
+                    # Check if message was sent by Theo (from Evan's account)
+                    text = msg.get('text', '')
+                    if '- Theo' in text or 'Theo (' in text:
+                        msg['display_name'] = 'Theo (assistant)'
+                    else:
+                        msg['display_name'] = name or sender
+            return messages
+    except Exception as e:
+        log(f"Error fetching watched chat context: {e}")
+    return []
+
+def forward_to_main_session(sender_name, message_text, chat_id, context_label):
+    """Forward a message from a watched chat to the main agent session with context"""
+    try:
+        # Get recent chat history for context
+        messages = get_chat_context_for_watched(chat_id)
+        context_str = ""
+        if messages:
+            context_str = "Recent chat history:\n"
+            for msg in messages:
+                name = msg.get('display_name', 'Unknown')
+                text = msg.get('text', '')[:300]
+                context_str += f"  {name}: {text}\n"
+
+        prompt = (
+            f"[Listened chat] Chat: {context_label} (chat_id={chat_id})\n"
+            f"New message from {sender_name or 'Unknown'}: {message_text}\n\n"
+            f"{context_str}\n"
+            f"You are Theo, Evan's assistant. You've been texting in this group chat on Evan's behalf.\n"
+            f"Based on the conversation, decide if you (Theo) should respond.\n"
+            f"Respond like a human assistant would — not just when directly addressed, but when it's socially natural.\n"
+            f"If you should respond, reply with ONLY valid JSON: {{\"respond\": true, \"message\": \"your message\"}}\n"
+            f"If no response needed: {{\"respond\": false}}\n"
+            f"Keep responses casual and brief. Always sign off as '- Theo (Evan\\'s assistant)'"
+        )
+        result = subprocess.run(
+            ['openclaw', 'agent', '--agent', 'worker',
+             '--message', prompt, '--json', '--thinking', 'off'],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            log(f"Forwarded to main session: {sender_name}: {message_text[:50]}...")
+            # Parse response to see if we should reply in the chat
+            try:
+                response_data = json.loads(result.stdout)
+                payloads = response_data.get('result', {}).get('payloads', [])
+                if payloads:
+                    agent_reply = payloads[0].get('text', '')
+                    if '{' in agent_reply:
+                        start = agent_reply.index('{')
+                        end = agent_reply.rindex('}') + 1
+                        decision = json.loads(agent_reply[start:end])
+                        if decision.get('respond') and decision.get('message'):
+                            reply_text = decision['message']
+                            escaped_text = shlex.quote(reply_text)
+                            send_result = subprocess.run(
+                                ['ssh', 'evan@localhost',
+                                 f"/opt/homebrew/bin/imsg send --chat-id {chat_id} --text {escaped_text}"],
+                                capture_output=True, text=True, timeout=30
+                            )
+                            if send_result.returncode == 0:
+                                log(f"Auto-replied in chat {chat_id}: {reply_text[:50]}...")
+                                refresh_watch_expiry(chat_id)
+                            else:
+                                log(f"Error auto-replying: {send_result.stderr}")
+                        else:
+                            log(f"No response needed for this message")
+            except Exception as e:
+                log(f"Error parsing watch response: {e}")
+        else:
+            err = result.stderr.strip()
+            log(f"Error forwarding to main: {err}")
+            alert_evan("forward_error", f"Listen forwarding broken: {err[:200]}")
+    except Exception as e:
+        log(f"Error forwarding to main session: {e}")
+        alert_evan("forward_exception", f"Listen forwarding exception: {e}")
+
+def is_watched_chat(chat_id):
+    """Check if a chat_id is in the watch list, return entry or None"""
+    chats = load_watched_chats()
+    for c in chats:
+        if c.get('chat_id') == chat_id:
+            return c
+    return None
+
+POSITIVE_REACTIONS = {'love', 'like', 'emphasis'}  # heart, thumbs-up, !!
+NEGATIVE_REACTIONS = {'dislike'}                     # thumbs-down
+# laugh, question, custom = ambiguous, ignore
+CONTEXT_MESSAGES = 10  # Number of recent messages for context
+
+def get_conversation_context(chat_id):
+    """Fetch recent messages from a chat for context"""
+    try:
+        result = subprocess.run(
+            ['ssh', 'evan@localhost', '/opt/homebrew/bin/imsg', 'history',
+             '--chat-id', str(chat_id), '--limit', str(CONTEXT_MESSAGES), '--json'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            messages = []
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    try:
+                        messages.append(json.loads(line))
+                    except:
+                        pass
+            # Sort oldest first for natural conversation flow
+            messages.sort(key=lambda x: x.get('created_at', ''))
+            return messages
+    except Exception as e:
+        log(f"Error fetching context: {e}")
+    return []
+
+def process_message(sender_phone, message_text, chat_id=None):
+    """Main processing pipeline"""
+    # Skip messages from self (evan's number) - DISABLED FOR TESTING
+    # if MY_NUMBER.replace('+', '') in sender_phone.replace('+', ''):
+    #     return
+
+    # Skip messages from the bot account
+    sender_lower = sender_phone.lower()
+    if any(bot_id in sender_lower for bot_id in BOT_IDENTIFIERS):
+        log(f"Skipping message from bot account: {sender_phone}")
+        return
+
+    # Skip messages that look like our own confirmations
+    if 'Want me to set a reminder' in message_text or 'add it to your calendar' in message_text.lower():
+        log(f"Skipping our own confirmation message")
+        return
+
+    sender_name = lookup_contact(sender_phone)
+    log(f"Processing message from {sender_name or sender_phone}: {message_text[:50]}...")
+
+    # Initialize decision record
+    record = {
+        "id": make_decision_id(),
+        "timestamp": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        "sender": sender_name or sender_phone,
+        "senderPhone": sender_phone,
+        "chatId": chat_id,
+        "messagePreview": message_text[:100],
+        "deepseek": None,
+        "escalated": False,
+        "claude": None,
+        "outcome": "none"
+    }
+
+    # Get conversation context if we have a chat_id
+    context = get_conversation_context(chat_id) if chat_id else None
+
+    # Classify with context
+    result = classify_message(sender_name, message_text, context)
+    action = result.get('action', 'none')
+    confidence = result.get('confidence', 0)
+
+    # Populate deepseek fields
+    deepseek_data = {}
+    if action == 'memory':
+        memory = result.get('memory', {})
+        deepseek_data = {"fact": memory.get('fact', ''), "category": memory.get('category', '')}
+    elif action == 'reminder':
+        reminder = result.get('reminder', {})
+        deepseek_data = {"what": reminder.get('what', ''), "when": reminder.get('when', '')}
+    elif action == 'calendar':
+        calendar = result.get('calendar', {})
+        deepseek_data = {"title": calendar.get('title', ''), "when": calendar.get('when', ''), "duration": calendar.get('duration_hours', 1), "location": calendar.get('location')}
+
+    record["deepseek"] = {
+        "action": action,
+        "confidence": confidence,
+        "data": deepseek_data
+    }
+
+    log(f"Classification: action={action}, confidence={confidence}")
+
+    # Take action based on classification
+    if action == 'memory' and confidence >= CONFIDENCE_THRESHOLD:
+        memory = result.get('memory', {})
+        fact = memory.get('fact', '')
+        category = memory.get('category', 'other')
+        if fact:
+            record["escalated"] = True
+            log(f"DeepSeek flagged memory, verifying with Claude...")
+            try:
+                verification = verify_memory_with_claude(sender_name, message_text, fact, category, context)
+                record["claude"] = {
+                    "decision": "approved" if verification.get('save_memory') else "rejected",
+                    "reason": verification.get('reason', ''),
+                    "rawResponse": verification
+                }
+                if verification.get('save_memory'):
+                    person = verification.get('person_name', sender_name)
+                    clean_fact = verification.get('fact', fact)
+                    clean_category = verification.get('category', category)
+                    add_to_memory(person, clean_fact, clean_category)
+                    record["outcome"] = "memory_saved"
+                else:
+                    log(f"Claude rejected memory: {verification.get('reason', 'not worth saving')}")
+                    record["outcome"] = "rejected"
+            except Exception as e:
+                log(f"Error in memory verification: {e}")
+                record["outcome"] = "error"
+                record["claude"] = {"decision": "error", "reason": str(e), "rawResponse": None}
+
+    elif action == 'reminder' and confidence >= CONFIDENCE_THRESHOLD:
+        reminder = result.get('reminder', {})
+        what = reminder.get('what', '')
+        when = reminder.get('when', '')
+        urgency = reminder.get('urgency', 'medium')
+        if what and when:
+            record["escalated"] = True
+            log(f"DeepSeek flagged reminder, verifying with Claude...")
+            try:
+                verification = verify_reminder_with_claude(sender_name, message_text, what, when, context)
+                record["claude"] = {
+                    "decision": "approved" if verification.get('needs_reminder') else "rejected",
+                    "reason": verification.get('reason', ''),
+                    "rawResponse": verification
+                }
+                if verification.get('needs_reminder'):
+                    message = verification.get('message', f"Reminder for {what}?")
+                    send_confirmation(message)
+                    record["outcome"] = "reminder_sent"
+                else:
+                    log(f"Claude rejected reminder: {verification.get('reason', 'not relevant')}")
+                    record["outcome"] = "rejected"
+            except Exception as e:
+                log(f"Error in reminder verification: {e}")
+                record["outcome"] = "error"
+                record["claude"] = {"decision": "error", "reason": str(e), "rawResponse": None}
+
+    elif action == 'calendar' and confidence >= CONFIDENCE_THRESHOLD:
+        calendar = result.get('calendar', {})
+        title = calendar.get('title', '')
+        when = calendar.get('when', '')
+        duration = calendar.get('duration_hours', 1)
+        location = calendar.get('location')
+        if title and when:
+            record["escalated"] = True
+            log(f"DeepSeek flagged calendar event, verifying with Claude...")
+            try:
+                verification = verify_calendar_with_claude(sender_name, message_text, title, when, duration, location, context)
+                record["claude"] = {
+                    "decision": "approved" if verification.get('add_to_calendar') else "rejected",
+                    "reason": verification.get('reason', ''),
+                    "rawResponse": verification
+                }
+                if verification.get('add_to_calendar'):
+                    message = verification.get('message', f"Add {title} to your calendar?")
+                    send_confirmation(message)
+                    record["outcome"] = "calendar_sent"
+                else:
+                    log(f"Claude rejected calendar: {verification.get('reason', 'not relevant')}")
+                    record["outcome"] = "rejected"
+            except Exception as e:
+                log(f"Error in calendar verification: {e}")
+                record["outcome"] = "error"
+                record["claude"] = {"decision": "error", "reason": str(e), "rawResponse": None}
+
+    elif action != 'none' and confidence < CONFIDENCE_THRESHOLD:
+        record["outcome"] = "below_threshold"
+        log(f"Below threshold (action={action}, confidence={confidence})")
+
+    else:
+        log(f"No action taken (action={action}, confidence={confidence})")
+
+    save_decision(record)
+
+POLL_INTERVAL = 3  # seconds
+STATE_FILE = CONFIG["state_file"]
+
+def load_state():
+    """Load last processed timestamp"""
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_state(state):
+    """Save state"""
+    # Cap processed_reactions to prevent unbounded growth
+    if 'processed_reactions' in state:
+        state['processed_reactions'] = state['processed_reactions'][-200:]
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f)
+
+def get_recent_messages():
+    """Get recent messages from all active chats"""
+    messages = []
+    try:
+        # Get recent chats
+        result = subprocess.run(
+            ['ssh', 'evan@localhost', '/opt/homebrew/bin/imsg', 'chats', '--limit', '5', '--json'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return []
+
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            try:
+                chat = json.loads(line)
+                chat_id = chat.get('id')
+                if chat_id:
+                    # Get recent messages from this chat
+                    hist = subprocess.run(
+                        ['ssh', 'evan@localhost', '/opt/homebrew/bin/imsg', 'history',
+                         '--chat-id', str(chat_id), '--limit', '5', '--json'],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if hist.returncode == 0:
+                        for msg_line in hist.stdout.strip().split('\n'):
+                            if msg_line:
+                                try:
+                                    messages.append(json.loads(msg_line))
+                                except:
+                                    pass
+            except:
+                pass
+    except Exception as e:
+        log(f"Error fetching messages: {e}")
+    return messages
+
+def check_reactions(messages, processed_reactions):
+    """Scan messages for new Evan reactions on bot messages"""
+    new_reaction_ids = []
+    for msg in messages:
+        sender = msg.get('sender', '').lower()
+        # Only look at bot messages
+        if not any(bot_id in sender for bot_id in BOT_IDENTIFIERS):
+            continue
+        text = msg.get('text', '')
+        if not text:
+            continue
+        for reaction in msg.get('reactions', []):
+            rid = reaction.get('id')
+            if not rid or rid in processed_reactions:
+                continue
+            # Only process Evan's reactions (is_from_me = true from evan's perspective)
+            if not reaction.get('is_from_me', False):
+                continue
+            rtype = reaction.get('type', '').lower()
+            if rtype in POSITIVE_REACTIONS or rtype in NEGATIVE_REACTIONS:
+                log(f"New {rtype} reaction on bot message: {text[:50]}...")
+                forward_reaction(rtype, text)
+                new_reaction_ids.append(rid)
+            else:
+                # Ambiguous reaction (laugh, question), mark processed but don't forward
+                new_reaction_ids.append(rid)
+    return new_reaction_ids
+
+def main():
+    """Poll for new messages"""
+    log("=" * 50)
+    log("Starting text processor daemon (polling mode)")
+    log(f"Model: {MODEL}")
+    log(f"Poll interval: {POLL_INTERVAL}s")
+    log(f"Memory directory: {MEMORY_DIR}")
+    load_contacts()
+    log("=" * 50)
+
+    state = load_state()
+    last_ts = state.get("last_timestamp")
+    processed_reactions = set(state.get("processed_reactions", []))
+
+    if not last_ts:
+        # Start from now
+        last_ts = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        log(f"Starting fresh from: {last_ts}")
+    else:
+        log(f"Resuming from: {last_ts}")
+
+    # Track whether we need to seed reactions on first poll
+    reactions_seeded = len(processed_reactions) > 0
+
+    while True:
+        try:
+            messages = get_recent_messages()
+
+            # Seed processed_reactions on first run to avoid processing old reactions
+            if not reactions_seeded:
+                for msg in messages:
+                    for reaction in msg.get('reactions', []):
+                        rid = reaction.get('id')
+                        if rid:
+                            processed_reactions.add(rid)
+                if messages:
+                    reactions_seeded = True
+                    log(f"Seeded {len(processed_reactions)} existing reaction IDs")
+                    save_state({"last_timestamp": last_ts, "processed_reactions": list(processed_reactions)})
+
+            # Check for new reactions on bot messages
+            new_reaction_ids = check_reactions(messages, processed_reactions)
+            if new_reaction_ids:
+                processed_reactions.update(new_reaction_ids)
+                save_state({"last_timestamp": last_ts, "processed_reactions": list(processed_reactions)})
+
+            # Filter to new received messages only (is_from_me=False means received)
+            new_msgs = [m for m in messages
+                       if m.get('created_at', '') > last_ts
+                       and not m.get('is_from_me', True)]
+
+            # Sort by timestamp
+            new_msgs.sort(key=lambda x: x.get('created_at', ''))
+
+            # Check for outgoing messages (is_from_me=True)
+            outgoing_msgs = [m for m in messages
+                       if m.get('created_at', '') > last_ts
+                       and m.get('is_from_me') is True]
+
+            for msg in outgoing_msgs:
+                text = msg.get('text', '')
+                chat_id = msg.get('chat_id')
+                msg_ts = msg.get('created_at', '')
+
+                if text and chat_id:
+                    # Auto-register chat when Theo sends a message (has signature)
+                    is_theo_message = '- Theo' in text or "Theo (Evan's assistant)" in text
+                    if is_theo_message:
+                        auto_register_chat(chat_id)
+
+                    # Forward Evan's own messages (not Theo's) in watched chats
+                    watch_entry = is_watched_chat(chat_id)
+                    if watch_entry and not is_theo_message:
+                        log(f"Evan message in watched chat {chat_id}: {text[:50]}...")
+                        context_label = watch_entry.get('context', f'chat {chat_id}')
+                        forward_to_main_session('Evan', text, chat_id, context_label)
+
+                    # Process Evan's own messages (not Theo's) through the same pipeline
+                    # This handles confirmations like "yes" to calendar/reminder requests
+                    if not is_theo_message:
+                        log(f"Processing Evan's message: {text[:50]}...")
+                        process_message(MY_NUMBER, text, chat_id)
+
+                if msg_ts and msg_ts > last_ts:
+                    last_ts = msg_ts
+                    save_state({"last_timestamp": last_ts, "processed_reactions": list(processed_reactions)})
+
+            for msg in new_msgs:
+                sender = msg.get('sender', '')
+                text = msg.get('text', '')
+                msg_ts = msg.get('created_at', '')
+                chat_id = msg.get('chat_id')
+
+                if text:
+                    log(f"New message from {sender}: {text[:50]}...")
+
+                    # Check if this is from a watched chat
+                    if chat_id:
+                        watch_entry = is_watched_chat(chat_id)
+                        if watch_entry:
+                            sender_name = lookup_contact(sender) or sender
+                            context_label = watch_entry.get('context', f'chat {chat_id}')
+                            forward_to_main_session(sender_name, text, chat_id, context_label)
+
+                    process_message(sender, text, chat_id)
+
+                if msg_ts and msg_ts > last_ts:
+                    last_ts = msg_ts
+                    save_state({"last_timestamp": last_ts, "processed_reactions": list(processed_reactions)})
+
+        except Exception as e:
+            log(f"Poll error: {e}")
+
+        time.sleep(POLL_INTERVAL)
+
+if __name__ == '__main__':
+    main()

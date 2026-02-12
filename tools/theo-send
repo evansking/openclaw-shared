@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+Send a message as Theo from Evan's iMessage account.
+
+Handles everything atomically:
+1. Appends signature
+2. Sends via ssh evan@localhost
+3. Registers chat for reply forwarding (with auto-detected name)
+
+Usage:
+    theo-send --chat-id 5 --text "Your message here"
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import os
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# Config file location
+CONFIG_FILE = os.path.expanduser("~/.config/text-processor/config.json")
+
+def load_config():
+    """Load config from file, fall back to defaults if not found."""
+    home = os.path.expanduser("~")
+    defaults = {
+        "my_number": "+1XXXXXXXXXX",
+        "bot_identifiers": ["your-bot@email.com"],
+        "contacts_file": os.path.join(home, "contacts.txt"),
+        "memory_dir": os.path.join(home, "memory/friends"),
+        "prompt_file": os.path.join(home, ".config/text-processor/classifier-prompt.txt"),
+        "watched_chats_file": os.path.join(home, ".config/text-processor/watched-chats.json"),
+        "decisions_file": os.path.join(home, ".openclaw/text-processor-decisions.json"),
+        "state_file": os.path.join(home, ".openclaw/text-processor-state.json"),
+        "signature": "- Assistant"
+    }
+    try:
+        with open(CONFIG_FILE) as f:
+            config = json.load(f)
+            return {**defaults, **config}
+    except Exception:
+        return defaults
+
+CONFIG = load_config()
+
+WATCHED_CHATS_FILE = Path(CONFIG["watched_chats_file"])
+CONTACTS_FILE = Path(CONFIG["contacts_file"])
+WATCH_TIMEOUT_SECONDS = 3600  # 1 hour
+SIGNATURE = CONFIG["signature"]
+
+
+def load_watched_chats():
+    try:
+        with open(WATCHED_CHATS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_watched_chats(chats):
+    WATCHED_CHATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(WATCHED_CHATS_FILE, "w") as f:
+        json.dump(chats, f, indent=2)
+
+
+def load_contacts():
+    """Load contacts into phone -> name map."""
+    contacts = {}
+    try:
+        with open(CONTACTS_FILE) as f:
+            for line in f:
+                if '|' in line:
+                    phone, name = line.strip().split('|', 1)
+                    # Normalize to last 10 digits
+                    key = ''.join(c for c in phone if c.isdigit())[-10:]
+                    if key:
+                        contacts[key] = name.strip()
+    except Exception:
+        pass
+    return contacts
+
+
+def lookup_contact(phone, contacts):
+    """Look up a phone number in contacts."""
+    key = ''.join(c for c in phone if c.isdigit())[-10:]
+    return contacts.get(key)
+
+
+def get_chat_name(chat_id):
+    """Look up chat name from imsg chats."""
+    try:
+        result = subprocess.run(
+            ["ssh", "evan@localhost", "/opt/homebrew/bin/imsg chats --limit 100 --json"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        if result.returncode != 0:
+            return None
+
+        contacts = load_contacts()
+
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            try:
+                chat = json.loads(line)
+                if chat.get('id') == chat_id:
+                    # Check if it has a name (group chat)
+                    if chat.get('name'):
+                        return chat['name']
+
+                    # 1:1 chat - identifier is the phone number
+                    identifier = chat.get('identifier', '')
+                    if identifier and not identifier.startswith('chat'):
+                        name = lookup_contact(identifier, contacts)
+                        if name:
+                            return name
+                        # Return cleaned phone if no contact match
+                        return identifier
+
+                    return None
+            except json.JSONDecodeError:
+                continue
+
+    except Exception:
+        pass
+
+    return None
+
+
+def register_chat(chat_id, context=None):
+    """Register chat for watching, or refresh if already registered."""
+    chats = load_watched_chats()
+    new_expiry = (datetime.now(timezone.utc) + timedelta(seconds=WATCH_TIMEOUT_SECONDS)).isoformat()
+
+    # Auto-detect context if not provided
+    if not context:
+        context = get_chat_name(chat_id) or f"chat {chat_id}"
+
+    # Check if already registered
+    for c in chats:
+        if c.get("chat_id") == chat_id:
+            c["expires_at"] = new_expiry
+            c["context"] = context  # Always update context
+            save_watched_chats(chats)
+            return
+
+    # Add new entry
+    chats.append({
+        "chat_id": chat_id,
+        "context": context,
+        "expires_at": new_expiry
+    })
+    save_watched_chats(chats)
+
+
+def send_message(chat_id, text):
+    """Send message via Evan's iMessage."""
+    # Escape for shell - use double quotes and escape internal quotes
+    escaped = text.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+    cmd = f'/opt/homebrew/bin/imsg send --chat-id {chat_id} --text "{escaped}"'
+
+    result = subprocess.run(
+        ["ssh", "evan@localhost", cmd],
+        capture_output=True,
+        text=True,
+        timeout=30
+    )
+    return result.returncode == 0, result.stderr
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Send message as Theo from Evan's account")
+    parser.add_argument("--chat-id", type=int, required=True, help="Chat ID to send to")
+    parser.add_argument("--text", required=True, help="Message text (signature added automatically)")
+    args = parser.parse_args()
+
+    # Build message with signature
+    message = f"{args.text}\n\n{SIGNATURE}"
+
+    # Send
+    success, error = send_message(args.chat_id, message)
+    if not success:
+        print(f"Send failed: {error}", file=sys.stderr)
+        sys.exit(1)
+
+    # Register for watching (auto-detects chat name)
+    register_chat(args.chat_id)
+
+    print(f"Sent to chat {args.chat_id}, watching for replies")
+
+
+if __name__ == "__main__":
+    main()
