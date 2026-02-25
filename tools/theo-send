@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Send a message as Theo from Evan's iMessage account.
+Send a message as the assistant from the owner's iMessage account.
 
 Handles everything atomically:
 1. Appends signature
-2. Sends via ssh evan@localhost
+2. Sends via SSH to the iMessage host
 3. Registers chat for reply forwarding (with auto-detected name)
 
 Usage:
@@ -34,7 +34,9 @@ def load_config():
         "watched_chats_file": os.path.join(home, ".config/text-processor/watched-chats.json"),
         "decisions_file": os.path.join(home, ".openclaw/text-processor-decisions.json"),
         "state_file": os.path.join(home, ".openclaw/text-processor-state.json"),
-        "signature": "- Assistant"
+        "signature": "- Assistant",
+        "ssh_target": "user@localhost",
+        "imsg_path": "/opt/homebrew/bin/imsg"
     }
     try:
         with open(CONFIG_FILE) as f:
@@ -49,6 +51,8 @@ WATCHED_CHATS_FILE = Path(CONFIG["watched_chats_file"])
 CONTACTS_FILE = Path(CONFIG["contacts_file"])
 WATCH_TIMEOUT_SECONDS = 3600  # 1 hour
 SIGNATURE = CONFIG["signature"]
+SSH_TARGET = CONFIG.get("ssh_target", "user@localhost")
+IMSG_PATH = CONFIG.get("imsg_path", "/opt/homebrew/bin/imsg")
 
 
 def load_watched_chats():
@@ -92,7 +96,7 @@ def get_chat_name(chat_id):
     """Look up chat name from imsg chats."""
     try:
         result = subprocess.run(
-            ["ssh", "evan@localhost", "/opt/homebrew/bin/imsg chats --limit 100 --json"],
+            ["ssh", SSH_TARGET, f"{IMSG_PATH} chats --limit 100 --json"],
             capture_output=True,
             text=True,
             timeout=15
@@ -158,13 +162,13 @@ def register_chat(chat_id, context=None):
 
 
 def send_message(chat_id, text):
-    """Send message via Evan's iMessage."""
+    """Send message via iMessage."""
     # Escape for shell - use double quotes and escape internal quotes
     escaped = text.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
-    cmd = f'/opt/homebrew/bin/imsg send --chat-id {chat_id} --text "{escaped}"'
+    cmd = f'{IMSG_PATH} send --chat-id {chat_id} --text "{escaped}"'
 
     result = subprocess.run(
-        ["ssh", "evan@localhost", cmd],
+        ["ssh", SSH_TARGET, cmd],
         capture_output=True,
         text=True,
         timeout=30
@@ -173,13 +177,16 @@ def send_message(chat_id, text):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Send message as Theo from Evan's account")
+    parser = argparse.ArgumentParser(description="Send message as assistant from owner's account")
     parser.add_argument("--chat-id", type=int, required=True, help="Chat ID to send to")
     parser.add_argument("--text", required=True, help="Message text (signature added automatically)")
     args = parser.parse_args()
 
-    # Build message with signature
-    message = f"{args.text}\n\n{SIGNATURE}"
+    # Build message with signature (avoid duplicating if already present)
+    if args.text.rstrip().endswith(SIGNATURE):
+        message = args.text
+    else:
+        message = f"{args.text}\n\n{SIGNATURE}"
 
     # Send
     success, error = send_message(args.chat_id, message)
